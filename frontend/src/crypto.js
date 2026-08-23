@@ -45,17 +45,38 @@ function generateDeviceId() {
 // Returns this installation's persistent device id, generating one the
 // very first time this app/browser runs. Never regenerated after that,
 // and never cleared on logout.
+//
+// Concurrency guard: on a brand-new install, more than one call site can
+// legitimately call this before anything is in IndexedDB yet (e.g. the
+// login key-setup effect and the "is this chat encrypted" effect both run
+// on mount). Without de-duplication each concurrent caller would generate
+// its OWN random id and race to write it to the same IndexedDB record —
+// see the identical (and more serious) version of this race in
+// getOrCreateKeypair below for why that's dangerous. Fixed the same way:
+// only one load-or-generate ever runs per app load; every concurrent
+// caller awaits that same in-flight operation.
+let deviceIdInflight = null;
 export async function getOrCreateDeviceId() {
   if (cachedDeviceId) return cachedDeviceId;
-  const stored = await idbGet(DEVICE_ID_RECORD);
-  if (stored && typeof stored === 'string') {
-    cachedDeviceId = stored;
-    return cachedDeviceId;
-  }
-  const id = generateDeviceId();
-  await idbSet(DEVICE_ID_RECORD, id);
-  cachedDeviceId = id;
-  return cachedDeviceId;
+  if (deviceIdInflight) return deviceIdInflight;
+  deviceIdInflight = (async () => {
+    try {
+      const stored = await idbGet(DEVICE_ID_RECORD);
+      if (stored && typeof stored === 'string') {
+        cachedDeviceId = stored;
+        console.log(`[e2ee] device id loaded from storage len=${stored.length}`);
+        return cachedDeviceId;
+      }
+      const id = generateDeviceId();
+      await idbSet(DEVICE_ID_RECORD, id);
+      cachedDeviceId = id;
+      console.log(`[e2ee] new device id generated len=${id.length}`);
+      return cachedDeviceId;
+    } finally {
+      deviceIdInflight = null;
+    }
+  })();
+  return deviceIdInflight;
 }
 
 function currentPlatform() {
@@ -130,6 +151,41 @@ let cachedKeypairUserId = null; // which user cachedKeypair belongs to
 // Call once at login with the logged-in user's id — the frontend also needs
 // to publish the public key (see publishPublicKey) so other users can
 // encrypt messages to this account.
+//
+// ── ROOT CAUSE FIX ────────────────────────────────────────────────────────
+// This is the actual source of the permanent "Unable to decrypt this
+// message" bug. On a brand-new device+account (empty IndexedDB), this
+// function is legitimately called from more than one place at almost the
+// same time on mount — e.g. ChatDashboard's login key-setup effect
+// (getOrCreateDeviceId -> getOrCreateKeypair -> publishPublicKey) and its
+// separate "is this chat encrypted" effect (which also calls
+// getOrCreateKeypair as soon as a DM chat is open, including a chat opened
+// immediately from a push notification tap). Previously, with no
+// concurrency guard, each concurrent caller would independently reach step
+// 3 below, each generate its OWN random nacl.box.keyPair(), and both
+// idbSet() the same IndexedDB record — whichever write committed LAST
+// silently won storage AND the shared `cachedKeypair` module variable.
+// The problem: publishPublicKey() reads `cachedKeypair` at the moment IT
+// runs and immediately POSTs that public key over the network (which
+// takes real time). If a second, independent getOrCreateKeypair() call
+// finishes generating and overwrites `cachedKeypair`/IndexedDB with a
+// DIFFERENT keypair before that POST resolves, the server ends up with
+// public key A registered for this device, while the device's actual
+// stored/used private key is B — a valid-looking but permanently
+// incompatible pair. Every future decrypt (of the device's own sent
+// messages, and of anything encrypted to it) then fails authentication in
+// nacl.box.open, forever, on this device — matching exactly what was
+// reported: brand-new messages failing, unaffected by rebuilding,
+// re-syncing, or redeploying, because the corruption lives in persisted
+// client-side IndexedDB state, not in the build.
+//
+// Fix: de-duplicate concurrent callers for the same uid onto a single
+// in-flight promise, so the load-or-generate logic can only ever run ONCE
+// per uid at a time. Every concurrent caller (and therefore
+// publishPublicKey) ends up awaiting and publishing the exact same
+// keypair. No architecture change — same storage shape, same public API.
+const keypairInflight = new Map(); // uid -> Promise<{secretKey, publicKey}>
+
 export async function getOrCreateKeypair(userId) {
   if (userId === undefined || userId === null || userId === '') {
     throw new Error('getOrCreateKeypair requires a userId (keys are scoped per account)');
@@ -138,48 +194,68 @@ export async function getOrCreateKeypair(userId) {
 
   if (cachedKeypair && cachedKeypairUserId === uid) return cachedKeypair;
 
-  // 1. This account already has its own scoped key on this device — use it.
-  const stored = await idbGet(privateKeyRecordName(uid));
-  if (stored && stored.secretKey && stored.publicKey) {
-    cachedKeypair = {
-      secretKey: naclUtil.decodeBase64(stored.secretKey),
-      publicKey: naclUtil.decodeBase64(stored.publicKey),
-    };
-    cachedKeypairUserId = uid;
-    return cachedKeypair;
-  }
+  const existingInflight = keypairInflight.get(uid);
+  if (existingInflight) return existingInflight;
 
-  // 2. One-time migration path for browsers that already had a key under
-  // the old, unscoped record (from before this fix). Hand it to the first
-  // account that logs in and claims it — almost always the same person who
-  // was already using this browser — so their existing private key (and
-  // their ability to decrypt their existing message history) is preserved
-  // instead of being silently replaced with a brand-new, unrelated key.
-  // The legacy record is copied, never deleted, and a marker prevents any
-  // *other* account from also claiming it later.
-  const legacy = await idbGet(LEGACY_PRIVATE_KEY_RECORD);
-  const migratedTo = await idbGet(LEGACY_MIGRATION_MARKER);
-  if (legacy && legacy.secretKey && legacy.publicKey && !migratedTo) {
-    await idbSet(privateKeyRecordName(uid), legacy);
-    await idbSet(LEGACY_MIGRATION_MARKER, uid);
-    cachedKeypair = {
-      secretKey: naclUtil.decodeBase64(legacy.secretKey),
-      publicKey: naclUtil.decodeBase64(legacy.publicKey),
-    };
-    cachedKeypairUserId = uid;
-    return cachedKeypair;
-  }
+  const inflight = (async () => {
+    try {
+      // 1. This account already has its own scoped key on this device — use it.
+      const stored = await idbGet(privateKeyRecordName(uid));
+      if (stored && stored.secretKey && stored.publicKey) {
+        const kp = {
+          secretKey: naclUtil.decodeBase64(stored.secretKey),
+          publicKey: naclUtil.decodeBase64(stored.publicKey),
+        };
+        cachedKeypair = kp;
+        cachedKeypairUserId = uid;
+        console.log(`[e2ee] keypair loaded from IndexedDB user=${uid} pubKeyLen=${kp.publicKey.length} secKeyLen=${kp.secretKey.length}`);
+        return kp;
+      }
 
-  // 3. Brand-new account on this device (or the legacy key was already
-  // claimed by someone else) — generate a fresh, isolated keypair.
-  const kp = nacl.box.keyPair();
-  await idbSet(privateKeyRecordName(uid), {
-    secretKey: naclUtil.encodeBase64(kp.secretKey),
-    publicKey: naclUtil.encodeBase64(kp.publicKey),
-  });
-  cachedKeypair = kp;
-  cachedKeypairUserId = uid;
-  return cachedKeypair;
+      // 2. One-time migration path for browsers that already had a key under
+      // the old, unscoped record (from before this fix). Hand it to the first
+      // account that logs in and claims it — almost always the same person who
+      // was already using this browser — so their existing private key (and
+      // their ability to decrypt their existing message history) is preserved
+      // instead of being silently replaced with a brand-new, unrelated key.
+      // The legacy record is copied, never deleted, and a marker prevents any
+      // *other* account from also claiming it later.
+      const legacy = await idbGet(LEGACY_PRIVATE_KEY_RECORD);
+      const migratedTo = await idbGet(LEGACY_MIGRATION_MARKER);
+      if (legacy && legacy.secretKey && legacy.publicKey && !migratedTo) {
+        await idbSet(privateKeyRecordName(uid), legacy);
+        await idbSet(LEGACY_MIGRATION_MARKER, uid);
+        const kp = {
+          secretKey: naclUtil.decodeBase64(legacy.secretKey),
+          publicKey: naclUtil.decodeBase64(legacy.publicKey),
+        };
+        cachedKeypair = kp;
+        cachedKeypairUserId = uid;
+        console.log(`[e2ee] keypair migrated from legacy record user=${uid} pubKeyLen=${kp.publicKey.length} secKeyLen=${kp.secretKey.length}`);
+        return kp;
+      }
+
+      // 3. Brand-new account on this device (or the legacy key was already
+      // claimed by someone else) — generate a fresh, isolated keypair.
+      const kp = nacl.box.keyPair();
+      await idbSet(privateKeyRecordName(uid), {
+        secretKey: naclUtil.encodeBase64(kp.secretKey),
+        publicKey: naclUtil.encodeBase64(kp.publicKey),
+      });
+      cachedKeypair = kp;
+      cachedKeypairUserId = uid;
+      console.log(`[e2ee] new keypair generated user=${uid} pubKeyLen=${kp.publicKey.length} secKeyLen=${kp.secretKey.length}`);
+      return kp;
+    } finally {
+      // Only remove this uid's in-flight marker once settled, so any
+      // caller that arrived while generation was still running shared this
+      // exact result instead of starting its own.
+      keypairInflight.delete(uid);
+    }
+  })();
+
+  keypairInflight.set(uid, inflight);
+  return inflight;
 }
 
 export function getCachedPublicKeyBase64() {
@@ -301,18 +377,18 @@ export async function fetchDeviceKeys(userId, token, { forceRefresh = false } = 
 export async function encryptForDevices(plaintext, targetDevices, userId) {
   const { secretKey } = await getOrCreateKeypair(userId);
   const messageBytes = naclUtil.decodeUTF8(plaintext);
-  return targetDevices
-    .filter(d => d && d.deviceId && d.publicKey)
-    .map((d) => {
-      const recipientPublicKey = naclUtil.decodeBase64(d.publicKey);
-      const nonce = nacl.randomBytes(nacl.box.nonceLength);
-      const box = nacl.box(messageBytes, nonce, recipientPublicKey, secretKey);
-      return {
-        deviceId: d.deviceId,
-        ciphertext: naclUtil.encodeBase64(box),
-        nonce: naclUtil.encodeBase64(nonce),
-      };
-    });
+  const usable = targetDevices.filter(d => d && d.deviceId && d.publicKey);
+  console.log(`[e2ee] encryptForDevices myKeyLen=${secretKey.length} targetDeviceCount=${usable.length}/${targetDevices.length}`);
+  return usable.map((d) => {
+    const recipientPublicKey = naclUtil.decodeBase64(d.publicKey);
+    const nonce = nacl.randomBytes(nacl.box.nonceLength);
+    const box = nacl.box(messageBytes, nonce, recipientPublicKey, secretKey);
+    return {
+      deviceId: d.deviceId,
+      ciphertext: naclUtil.encodeBase64(box),
+      nonce: naclUtil.encodeBase64(nonce),
+    };
+  });
 }
 
 // Picks the payload entry meant for THIS device out of a message's
@@ -335,10 +411,17 @@ export async function decryptFromSenderDevice(ciphertextB64, nonceB64, senderPub
     const senderPublicKey = naclUtil.decodeBase64(senderPublicKeyB64);
     const ciphertext = naclUtil.decodeBase64(ciphertextB64);
     const nonce = naclUtil.decodeBase64(nonceB64);
+    // Safe to log: byte lengths only, never the decoded key/ciphertext/nonce
+    // values themselves. A wrong length here (e.g. senderPublicKey !== 32
+    // bytes) points straight at a base64/Uint8Array conversion bug rather
+    // than a key-mismatch, which is otherwise indistinguishable from the
+    // outside (both just make nacl.box.open return null).
+    console.log(`[e2ee] decryptFromSenderDevice myKeyLen=${secretKey.length} senderKeyLen=${senderPublicKey.length} ciphertextLen=${ciphertext.length} nonceLen=${nonce.length}`);
     const opened = nacl.box.open(ciphertext, nonce, senderPublicKey, secretKey);
     if (!opened) return null; // authentication failed — tampered or wrong key
     return naclUtil.encodeUTF8(opened);
-  } catch {
+  } catch (e) {
+    console.warn('[e2ee] decryptFromSenderDevice threw:', e && e.message ? e.message : e);
     return null;
   }
 }
