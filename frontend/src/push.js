@@ -1,160 +1,190 @@
-// Android push notifications (Firebase Cloud Messaging via the official
-// @capacitor/push-notifications plugin).
+// Firebase Cloud Messaging (Android push notifications).
 //
-// Every function here is a no-op on the web build — Capacitor.isNativePlatform()
-// is false in the browser, so none of this ever touches native APIs there.
-// This keeps the existing browser app (and its own Notification-API-based
-// in-app alerts in ChatDashboard.jsx) completely unchanged.
-import axios from 'axios';
-import { Capacitor } from '@capacitor/core';
-import { API_URL } from './config';
-const FCM_TOKEN_STORAGE_KEY = 'chat_fcm_token';
-const PENDING_NOTIFICATION_STORAGE_KEY = 'chat_pending_notification';
+// This module is intentionally the ONLY place in the backend that talks to
+// Firebase. Credentials are loaded once from the FIREBASE_SERVICE_ACCOUNT
+// env var (a full service-account JSON, optionally base64-encoded) and never
+// touch the frontend/Vite build or get logged.
+//
+// If the env var isn't set (or is invalid), every exported function becomes
+// a safe no-op — the rest of the app (auth, chat, Socket.IO, calling) keeps
+// working exactly as before push was added. A push failure or missing
+// config must NEVER break message sending.
+const admin = require('firebase-admin');
+const { getMessaging } = require('firebase-admin/messaging');
+const db = require('./database');
 
-const isNativeAndroid = () =>
-  Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+let firebaseApp = null;
+let initError = null;
+let attemptedInit = false;
 
-// Turns the raw data payload Android hands back (all-string map, plus some
-// "google.*" bookkeeping keys we don't care about) into the shape the rest
-// of the app understands: which conversation to open.
-function extractConversationTarget(data) {
-  if (!data || !data.conversationType || !data.conversationId) return null;
-  return {
-    conversationType: data.conversationType, // 'direct' | 'group'
-    conversationId: data.conversationId,
-    senderId: data.senderId || null,
-    messageId: data.messageId || null,
-  };
-}
-
-function savePendingNotification(target) {
+function loadServiceAccount() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw || !raw.trim()) return null;
   try {
-    localStorage.setItem(PENDING_NOTIFICATION_STORAGE_KEY, JSON.stringify(target));
-  } catch (_) { /* ignore storage errors */ }
-}
-
-// Reads and CONSUMES (clears) the pending notification target, if any.
-// Call this once contacts/groups have loaded, exactly like the app's
-// existing openAnnouncement-on-login pattern — this is what lets a tap on a
-// notification open the right conversation even from a fully cold start,
-// where the app has to finish auth + data loading before it can navigate.
-export function consumePendingNotification() {
-  try {
-    const raw = localStorage.getItem(PENDING_NOTIFICATION_STORAGE_KEY);
-    if (!raw) return null;
-    localStorage.removeItem(PENDING_NOTIFICATION_STORAGE_KEY);
-    return JSON.parse(raw);
-  } catch (_) {
+    const trimmed = raw.trim();
+    const jsonStr = trimmed.startsWith('{') ? trimmed : Buffer.from(trimmed, 'base64').toString('utf8');
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    initError = `FIREBASE_SERVICE_ACCOUNT is set but could not be parsed: ${e.message}`;
     return null;
   }
 }
 
-let listenersRegistered = false;
+function getFirebaseApp() {
+  if (attemptedInit) return firebaseApp;
+  attemptedInit = true;
 
-// Sets up FCM: requests notification permission (Android 13+ shows the
-// system prompt; on refusal we simply stop here and the app continues
-// working normally with Socket.IO-only realtime updates), registers for a
-// token, creates the notification channel, sends the token to the backend,
-// and wires up tap handling for foreground/background/cold-start.
-//
-// onNotificationTap(target) is called immediately if the app is already
-// running when a notification is tapped (background→foreground case) so
-// the UI can navigate right away, in addition to the target being stashed
-// for consumePendingNotification() to pick up on a cold start.
-export async function registerPushNotifications({ onNotificationTap } = {}) {
-  console.log('[PUSH] registerPushNotifications() STARTED');
-  if (!isNativeAndroid()) return; // web build: nothing to do
+  const serviceAccount = loadServiceAccount();
+  if (!serviceAccount) return null;
+
   try {
-    // Import lazily so the plugin's JS is only ever touched on native Android.
-    const { PushNotifications } = await import('@capacitor/push-notifications');
-
-    if (!listenersRegistered) {
-      listenersRegistered = true;
-
-      PushNotifications.addListener('registration', async (token) => {
-        try {
-          // TEMP DIAGNOSTIC — never logs the full token, only a masked prefix.
-          const masked = token?.value ? `${String(token.value).slice(0, 8)}…(${String(token.value).length} chars)` : '(empty)';
-          console.log(`[PUSH] registration token received: ${masked}`);
-          localStorage.setItem(FCM_TOKEN_STORAGE_KEY, token.value);
-          await axios.post(`${API_URL}/devices/register`, { token: token.value, platform: 'android' });
-          console.log('[PUSH] /devices/register succeeded — token stored on backend');
-        } catch (err) {
-          // A failed registration must never break the app — chat keeps
-          // working over Socket.IO regardless.
-          console.error('[PUSH] Failed to register push token with backend:', err?.message || err);
-        }
-      });
-
-      PushNotifications.addListener('registrationError', (err) => {
-        console.warn('[PUSH] registration error (notifications will be unavailable):', err);
-      });
-
-      // App open/foreground: Android (via the plugin) already shows the
-      // system notification per capacitor.config.json's presentationOptions,
-      // so there's nothing extra to render here.
-      PushNotifications.addListener('pushNotificationReceived', () => {});
-
-      // Notification tapped — covers background AND cold start (the plugin
-      // buffers the launch notification until this listener exists).
-      PushNotifications.addListener('pushNotificationActionPerformed', (action) => {
-        try {
-          const data = action?.notification?.data || {};
-          const target = extractConversationTarget(data);
-          if (!target) return;
-          savePendingNotification(target);
-          if (typeof onNotificationTap === 'function') onNotificationTap(target);
-        } catch (err) {
-          console.error('Failed to handle notification tap:', err?.message || err);
-        }
-      });
-    }
-
-    let permStatus = await PushNotifications.checkPermissions();
-    console.log('[PUSH] Permission status:', permStatus);
-    if (permStatus.receive === 'prompt' || permStatus.receive === 'prompt-with-rationale') {
-      permStatus = await PushNotifications.requestPermissions();
-    }
-    if (permStatus.receive !== 'granted') {
-  console.log('[PUSH] Permission NOT granted:', permStatus.receive);
-  return;
+    firebaseApp = admin.apps && admin.apps.length
+      ? admin.app()
+      : admin.initializeApp({ credential: admin.cert(serviceAccount) });
+    // Safe to log: the project_id is not a secret (it's also visible in
+    // the Android app's committed google-services.json) — logging it once
+    // at startup lets you directly compare "is the backend using the same
+    // Firebase project as the app was built against?" without needing to
+    // decode any credentials.
+    console.log(`[push] Firebase Admin initialized for project_id=${serviceAccount.project_id || 'unknown'}`);
+  } catch (e) {
+    initError = `Failed to initialize Firebase Admin: ${e.message}`;
+    firebaseApp = null;
+  }
+  return firebaseApp;
 }
 
-console.log('[PUSH] Permission granted');
-    // Heads-up delivery requires a channel with high importance to exist on
-    // the device before a message referencing it arrives.
-    await PushNotifications.createChannel({
-      id: 'aerio_messages',
-      name: 'Messages',
-      description: 'New chat messages',
-      importance: 5,
-      visibility: 1,
-      vibration: true,
+let warnedOnce = false;
+function isConfigured() {
+  const ok = !!getFirebaseApp();
+  if (!ok && !warnedOnce) {
+    warnedOnce = true;
+    console.warn(
+      '[push] Firebase Admin is not configured' +
+      (initError ? ` (${initError})` : ' (FIREBASE_SERVICE_ACCOUNT env var is not set)') +
+      ' — push notifications are disabled. Socket.IO real-time chat and everything else is unaffected.'
+    );
+  }
+  return ok;
+}
+
+// Sends one push notification to every ACTIVE token belonging to userId.
+// Invalid/expired tokens (app uninstalled, token revoked, etc.) are
+// deactivated automatically so we stop retrying them. This function never
+// throws — a push failure must never break message sending.
+async function sendToUser(userId, { title, body, data = {} }) {
+  try {
+    if (!isConfigured()) {
+      // Safe to log every time (not just once) — if FIREBASE_SERVICE_ACCOUNT
+      // was lost/changed on a redeploy, this is the single most useful line
+      // in the logs to confirm that's exactly what's happening.
+      console.log(`[push] sendToUser(${userId}): skipped — Firebase not configured (${initError || 'FIREBASE_SERVICE_ACCOUNT not set'})`);
+      return;
+    }
+    if (!userId) return;
+
+    const { rows } = await db.query(
+      'SELECT token, created_at FROM device_tokens WHERE user_id = $1 AND active = TRUE',
+      [userId]
+    );
+    const tokens = rows.map((r) => r.token).filter(Boolean);
+    // Safe to log: count + how old the newest token is, never token values.
+    const newestTokenAgeSec = rows.length
+      ? Math.round((Date.now() - new Date(Math.max(...rows.map(r => new Date(r.created_at).getTime())))) / 1000)
+      : null;
+    console.log(`[push] sendToUser(${userId}): activeTokens=${tokens.length}${newestTokenAgeSec !== null ? ` newestTokenAgeSec=${newestTokenAgeSec}` : ''}`);
+    if (!tokens.length) return;
+
+    // FCM data payloads must be a flat map of strings.
+    const stringData = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (v !== undefined && v !== null) stringData[k] = String(v);
+    }
+
+    const message = {
+      tokens,
+      notification: { title: String(title || 'Aerio'), body: String(body || '') },
+      data: stringData,
+      android: {
+        priority: 'high',
+        notification: {
+          // CRITICAL FIX: In FCM HTTP v1, when `android.notification` is
+          // present it COMPLETELY OVERRIDES the top-level `notification`
+          // block for Android. Previously this block only had channelId/icon/
+          // color and no title/body, so Android received a notification with
+          // no title or body — which is why no system notification appeared.
+          // Title and body MUST be repeated here for Android to display them.
+          title: String(title || 'Aerio'),
+          body: String(body || ''),
+          channelId: 'aerio_messages',
+          icon: 'ic_stat_aerio',
+          color: '#3b82f6',
+          // No clickAction here on purpose: it must name an activity with a
+          // matching <intent-filter>, and no such activity/action exists in
+          // this app or in @capacitor/push-notifications' own manifest. An
+          // unresolvable clickAction can make Android fail to build the
+          // notification's PendingIntent at all (E/FirebaseMessaging:
+          // "Notification pending intent canceled"), which on some Android
+          // versions/OEMs suppresses the whole notification, not just the
+          // tap. Leaving this unset falls back to the default launcher
+          // activity, which @capacitor/push-notifications already wires up
+          // natively for pushNotificationActionPerformed / cold-start tap
+          // buffering — no clickAction override needed for that to work.
+        },
+      },
+    };
+
+    const result = await getMessaging(firebaseApp).sendEachForMulticast(message);
+    console.log(
+      `[push] sendToUser(${userId}): ${result.successCount}/${tokens.length} delivered to FCM` +
+      (result.failureCount ? `, ${result.failureCount} failed` : '')
+    );
+
+    const deadTokens = [];
+    let mismatchedCredentialCount = 0;
+    result.responses.forEach((r, i) => {
+      if (!r.success) {
+        const code = r.error && r.error.code;
+        // Distinguished from a genuinely dead/uninstalled token: this code
+        // means the token belongs to a DIFFERENT Firebase project than the
+        // one FIREBASE_SERVICE_ACCOUNT authenticates as — e.g. the app was
+        // rebuilt against a different google-services.json, or the backend
+        // credential was swapped. Deactivating tokens for this reason would
+        // hide the real cause (it looks identical to a normal dead token
+        // otherwise), so it's counted and logged separately instead.
+        if (code === 'messaging/mismatched-credential' || code === 'messaging/sender-id-mismatch') {
+          mismatchedCredentialCount++;
+        } else if (
+          code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token' ||
+          code === 'messaging/invalid-argument'
+        ) {
+          deadTokens.push(tokens[i]);
+        } else {
+          console.error('[push] send failed for a token:', code || (r.error && r.error.message));
+        }
+      }
     });
-  console.log('[PUSH] Calling PushNotifications.register()');
 
-    await PushNotifications.register();
-    console.log('[PUSH] PushNotifications.register() completed');
-  } catch (err) {
-    // Never let push setup break the rest of the app.
-    console.error('registerPushNotifications failed:', err?.message || err);
-  }
-}
-
-// Call on logout so a shared/borrowed device stops receiving notifications
-// for an account nobody is signed into anymore.
-export async function unregisterPushNotifications() {
-  if (!isNativeAndroid()) return;
-  try {
-    const token = localStorage.getItem(FCM_TOKEN_STORAGE_KEY);
-    if (token) {
-      await axios.post(`${API_URL}/devices/unregister`, { token }).catch(() => {});
+    if (mismatchedCredentialCount) {
+      console.error(
+        `[push] sendToUser(${userId}): ${mismatchedCredentialCount} token(s) rejected as ` +
+        `mismatched-credential — these tokens belong to a different Firebase project than ` +
+        `FIREBASE_SERVICE_ACCOUNT authenticates as. Check the Android app's google-services.json ` +
+        `project_id matches the backend's FIREBASE_SERVICE_ACCOUNT project_id.`
+      );
     }
-    localStorage.removeItem(FCM_TOKEN_STORAGE_KEY);
-    const { PushNotifications } = await import('@capacitor/push-notifications');
-    await PushNotifications.removeAllListeners();
-    listenersRegistered = false;
+
+    if (deadTokens.length) {
+      await db.query(
+        'UPDATE device_tokens SET active = FALSE, updated_at = NOW() WHERE token = ANY($1::text[])',
+        [deadTokens]
+      );
+    }
   } catch (err) {
-    console.error('unregisterPushNotifications failed:', err?.message || err);
+    // Never let a push failure propagate — it must never fail the actual message.
+    console.error('[push] sendToUser error:', err.message);
   }
 }
+
+module.exports = { sendToUser, isConfigured };
