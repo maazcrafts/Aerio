@@ -1689,6 +1689,14 @@ app.post('/api/devices/register', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'token is required' });
     }
     const plat = (platform === 'ios' || platform === 'web') ? platform : 'android';
+    // Safe diagnostic: was there already a DIFFERENT active token on file
+    // for this user (e.g. a stale pre-reinstall token)? Token values
+    // themselves are never logged — only counts/ages.
+    const existing = await db.query(
+      "SELECT token, created_at FROM device_tokens WHERE user_id = $1 AND platform = $2 AND active = TRUE",
+      [req.user.id, plat]
+    );
+    const isNewToken = !existing.rows.some(r => r.token === token);
     await db.query(
       `INSERT INTO device_tokens (user_id, token, platform, active, updated_at)
        VALUES ($1, $2, $3, TRUE, NOW())
@@ -1699,9 +1707,11 @@ app.post('/api/devices/register', authenticateToken, async (req, res) => {
          updated_at = NOW()`,
       [req.user.id, token, plat]
     );
+    console.log(`[push] POST /devices/register user=${req.user.id} platform=${plat} status=200 newToken=${isNewToken} priorActiveTokensForUser=${existing.rows.length}`);
     res.json({ ok: true });
   } catch (err) {
-    console.error('Device register error:', err.message);
+    console.error(`[push] Device register error user=${req.user?.id}:`, err.message);
+    console.log(`[push] POST /devices/register user=${req.user?.id} status=500`);
     res.status(500).json({ error: 'Failed to register device' });
   }
 });
@@ -1717,9 +1727,10 @@ app.post('/api/devices/unregister', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'token is required' });
     }
     await db.query('DELETE FROM device_tokens WHERE token = $1 AND user_id = $2', [token, req.user.id]);
+    console.log(`[push] POST /devices/unregister user=${req.user.id} status=200`);
     res.json({ ok: true });
   } catch (err) {
-    console.error('Device unregister error:', err.message);
+    console.error(`[push] Device unregister error user=${req.user?.id}:`, err.message);
     res.status(500).json({ error: 'Failed to unregister device' });
   }
 });
