@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "665903339430",
+    "project_id": "aerio-ace33",
+    "storage_bucket": "aerio-ace33.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:665903339430:android:71e14e678bd44781e2a167",
+        "android_client_info": {
+          "package_name": "com.maaz.aerio"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB3n-vEBkuXhlkeymtqNLoZi1WrX1zxTls"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
