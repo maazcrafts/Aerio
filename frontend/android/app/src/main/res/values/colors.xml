@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Used for the status-bar push notification icon tint (see AndroidManifest.xml
+         and backend/push.js). Matches Aerio's accent blue. -->
+    <color name="notification_icon_color">#3b82f6</color>
+</resources>

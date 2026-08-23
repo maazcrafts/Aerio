@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar / push-notification icon. Android requires this to be pure
+     white shapes on a transparent background — the system tints it itself
+     (see notification_icon_color in colors.xml and AndroidManifest.xml).
+     A colored version of the real Aerio logo would render as a solid white
+     blob, so this is a simple chat-bubble glyph instead. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M20,2H4C2.9,2 2,2.9 2,4V22L6,18H20C21.1,18 22,17.1 22,16V4C22,2.9 21.1,2 20,2Z" />
+</vector>
