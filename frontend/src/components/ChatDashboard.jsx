@@ -17,7 +17,11 @@ import SettingsModal from './SettingsModal';
 import StarredMessagesModal from './StarredMessagesModal';
 import { applyAppearance, applyLocalAppearance, getLocalSettings } from '../utils/appearance';
 import { registerPushNotifications, unregisterPushNotifications, consumePendingNotification } from '../push';
-import { getOrCreateKeypair, getCachedPublicKeyBase64, publishPublicKey, fetchPublicKey, encryptForRecipient, decryptFromSender, resetE2eeState } from '../crypto';
+import {
+  getOrCreateKeypair, getCachedPublicKeyBase64, getOrCreateDeviceId,
+  publishPublicKey, fetchDeviceKeys, encryptForDevices, decryptFromSenderDevice,
+  pickPayloadForDevice, resetE2eeState,
+} from '../crypto';
 import { ContactsSkeleton, MessagesSkeleton, ErrorState, NoInternetState, SlowNetworkState, NoResultsState } from './UIStates';
 import { useNetworkStatus, useSlowRequestTimer } from '../hooks/useNetworkStatus';
 let socket;
@@ -482,21 +486,60 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
   const [userSearchResults, setUserSearchResults] = useState([]);
 
   const decryptIncomingMessage = async (msgObj) => {
-    if (msgObj.group_id || !msgObj.ciphertext || !msgObj.nonce) return msgObj;
+    if (msgObj.group_id) return msgObj;
     const otherPartyId = Number(msgObj.sender_id) === Number(user.id) ? msgObj.receiver_id : msgObj.sender_id;
-    const otherPartyKey = await fetchPublicKey(otherPartyId, user.token);
-    // Safe diagnostic log: ids + booleans only — never key material,
-    // ciphertext, nonce, or plaintext.
-    console.log(`[e2ee] decrypt attempt message=${msgObj.id} sender=${msgObj.sender_id} receiver=${msgObj.receiver_id} otherPartyKeyFound=${!!otherPartyKey}`);
+
+    // ── New multi-device shape: e2ee_recipients is an array of per-device
+    // payloads. Find the entry addressed to THIS device.
+    if (msgObj.e2ee_recipients) {
+      const myDeviceId = await getOrCreateDeviceId();
+      const payload = pickPayloadForDevice(msgObj.e2ee_recipients, myDeviceId);
+      console.log(`[e2ee] decrypt attempt message=${msgObj.id} device=${myDeviceId} payloadFound=${!!payload}`);
+      if (!payload) {
+        // This message was encrypted before this device existed/published
+        // a key — expected for a brand-new device, not a bug.
+        console.warn(`[e2ee] decrypt skipped: no payload for this device (message ${msgObj.id})`);
+        return { ...msgObj, content: '[Unable to decrypt on this device]' };
+      }
+      // The sender's public key must come from the SAME device that did
+      // the encrypting (msgObj.sender_device_id) — a sender may have
+      // multiple devices with different keys, and using the wrong one
+      // fails authentication even though a payload exists.
+      const senderId = msgObj.sender_id;
+      let senderPublicKey = null;
+      if (msgObj.sender_device_id === myDeviceId) {
+        // I'm reading back my own outgoing message on the very device that
+        // sent it — my own current public key is the one that was used.
+        senderPublicKey = getCachedPublicKeyBase64();
+      } else {
+        const { devices } = await fetchDeviceKeys(senderId, user.token);
+        const senderDevice = devices.find(d => d.deviceId === msgObj.sender_device_id);
+        senderPublicKey = senderDevice ? senderDevice.publicKey : null;
+      }
+      if (!senderPublicKey) {
+        console.warn(`[e2ee] decrypt skipped: sender device key unavailable (message ${msgObj.id}, senderDevice=${msgObj.sender_device_id})`);
+        return { ...msgObj, content: '[Unable to decrypt — key unavailable]' };
+      }
+      const plaintext = await decryptFromSenderDevice(payload.ciphertext, payload.nonce, senderPublicKey, user.id);
+      console.log(`[e2ee] decrypt result message=${msgObj.id} device=${myDeviceId} success=${plaintext !== null}`);
+      if (plaintext === null) {
+        console.warn(`[e2ee] decrypt failed (key mismatch or corrupted ciphertext): message ${msgObj.id}`);
+      }
+      return { ...msgObj, content: plaintext !== null ? plaintext : '[Unable to decrypt this message]' };
+    }
+
+    // ── Legacy single-key shape (pre multi-device fix): old rows only.
+    // Best-effort only — may permanently fail if the key that produced it
+    // is gone, which is expected, not a bug.
+    if (!msgObj.ciphertext || !msgObj.nonce) return msgObj;
+    const { devices, legacyPublicKey } = await fetchDeviceKeys(otherPartyId, user.token);
+    const otherPartyKey = legacyPublicKey || (devices[0] && devices[0].publicKey) || null;
+    console.log(`[e2ee] legacy decrypt attempt message=${msgObj.id} otherPartyKeyFound=${!!otherPartyKey}`);
     if (!otherPartyKey) {
-      console.warn(`[e2ee] decrypt skipped: no public key on file for user ${otherPartyId} (message ${msgObj.id})`);
       return { ...msgObj, content: '[Unable to decrypt — key unavailable]' };
     }
-    const plaintext = await decryptFromSender(msgObj.ciphertext, msgObj.nonce, otherPartyKey, user.id);
-    console.log(`[e2ee] decrypt result message=${msgObj.id} sender=${msgObj.sender_id} receiver=${msgObj.receiver_id} success=${plaintext !== null}`);
-    if (plaintext === null) {
-      console.warn(`[e2ee] decrypt failed (key mismatch or corrupted ciphertext): message ${msgObj.id}, other party ${otherPartyId}`);
-    }
+    const plaintext = await decryptFromSenderDevice(msgObj.ciphertext, msgObj.nonce, otherPartyKey, user.id);
+    console.log(`[e2ee] legacy decrypt result message=${msgObj.id} success=${plaintext !== null}`);
     return { ...msgObj, content: plaintext !== null ? plaintext : '[Unable to decrypt this message]' };
   };
 
@@ -1001,11 +1044,12 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
         if (!cancelled) setActiveChatEncrypted(false);
         return;
       }
-      const [myKey, theirKey] = await Promise.all([
+      const [myKey, theirKeys] = await Promise.all([
         getOrCreateKeypair(user.id).then(() => getCachedPublicKeyBase64()),
-        fetchPublicKey(activeChat.id, user.token),
+        fetchDeviceKeys(activeChat.id, user.token),
       ]);
-      if (!cancelled) setActiveChatEncrypted(!!myKey && !!theirKey);
+      const theirHasKey = (theirKeys.devices && theirKeys.devices.length > 0) || !!theirKeys.legacyPublicKey;
+      if (!cancelled) setActiveChatEncrypted(!!myKey && theirHasKey);
     })();
     return () => { cancelled = true; };
   }, [activeChat]);
@@ -1071,6 +1115,7 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
 
     (async () => {
       try {
+        await getOrCreateDeviceId();
         await getOrCreateKeypair(user.id);
         await publishPublicKey(user.token, user.id);
       } catch (e) {
@@ -1659,19 +1704,32 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
       return;
     }
     (async () => {
-      let ciphertext = null, nonce = null;
+      let recipients = null, senderDeviceId = null;
       if (!activeChat.is_group && content) {
         try {
+          const myDeviceId = await getOrCreateDeviceId();
           // forceRefresh: always encrypt against the recipient's CURRENT
-          // key, not a possibly-stale cached one from earlier in this
-          // session (see the fetchPublicKey cache-TTL comment in crypto.js
-          // — this is what "immediately before encrypting" means).
-          const recipientKey = await fetchPublicKey(activeChat.id, user.token, { forceRefresh: true });
-          console.log(`[e2ee] send: recipient=${activeChat.id} hasKey=${!!recipientKey}`);
-          if (recipientKey) {
-            const enc = await encryptForRecipient(content, recipientKey, user.id);
-            ciphertext = enc.ciphertext;
-            nonce = enc.nonce;
+          // set of devices, not a possibly-stale cached one from earlier in
+          // this session (see the fetchDeviceKeys cache-TTL comment in
+          // crypto.js — this is what "immediately before encrypting" means).
+          const [recipientKeys, myKeys] = await Promise.all([
+            fetchDeviceKeys(activeChat.id, user.token, { forceRefresh: true }),
+            fetchDeviceKeys(user.id, user.token, { forceRefresh: true }),
+          ]);
+          // Fan out to every device of the recipient, plus every OTHER
+          // device already registered for this account (so those sessions
+          // can also decrypt this sent message), plus this device itself
+          // (so reloading history on this same device stays consistent
+          // with every other case instead of needing a special path).
+          const targetDevices = [
+            ...recipientKeys.devices,
+            ...myKeys.devices.filter(d => d.deviceId !== myDeviceId),
+            { deviceId: myDeviceId, publicKey: getCachedPublicKeyBase64() },
+          ];
+          console.log(`[e2ee] send: recipient=${activeChat.id} targetDeviceCount=${targetDevices.length}`);
+          if (targetDevices.length > 0) {
+            recipients = await encryptForDevices(content, targetDevices, user.id);
+            senderDeviceId = myDeviceId;
           }
         } catch (e) {
           console.error('[e2ee] Encryption failed, falling back to plaintext:', e && e.message ? e.message : e);
@@ -1681,9 +1739,9 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
         senderId: user.id,
         receiverId: activeChat.is_group ? null : activeChat.id,
         groupId: activeChat.is_group ? activeChat.id : null,
-        content: ciphertext ? '' : content,
-        ciphertext,
-        nonce,
+        content: recipients ? '' : content,
+        recipients,
+        senderDeviceId,
         imageUrl,
         type,
         viewOnce: !!customPayload?.viewOnce,

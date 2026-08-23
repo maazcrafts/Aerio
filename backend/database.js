@@ -38,12 +38,40 @@ async function initDb() {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;`);
-    // E2EE: this device's X25519 public key (base64, 32 bytes decoded).
-    // The matching PRIVATE key never leaves the user's device — it is never
-    // sent here, never stored here, and this column alone is useless for
-    // decrypting anything. Nullable: a user hasn't necessarily published a
-    // key yet (fresh account, or a client that predates E2EE).
+    // E2EE (legacy, single-key model): kept ONLY for backward compatibility
+    // with clients that predate multi-device support and for reading old
+    // rows. No longer written to by current clients — see device_keys
+    // below, which is what fixed "same account, different device
+    // overwrites the other device's key" (multi-device E2EE fix).
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT;`);
+
+    // E2EE multi-device key directory. One row PER (device, account) pair,
+    // never per account alone — this is the actual fix for devices
+    // overwriting each other's public key. A device keeps a persistent
+    // `device_id` (generated once per installation, survives logout) and
+    // publishes/re-publishes its OWN row here on every login. Composite
+    // primary key means:
+    //   - the same device publishing again just updates its own row
+    //   - a second device for the same user gets its OWN row, and can never
+    //     overwrite the first device's row
+    //   - the same device_id later used by a different account also gets
+    //     its own row (rare, but harmless: shared/borrowed device case)
+    // The matching PRIVATE key never leaves the originating device — this
+    // table only ever holds public keys, useless for decrypting anything.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS device_keys (
+        device_id TEXT NOT NULL,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        public_key TEXT NOT NULL,
+        platform TEXT DEFAULT 'web',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (device_id, user_id)
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_device_keys_user ON device_keys(user_id);
+    `);
 
     // OTP Table for Signup and Password Reset
     await client.query(`
@@ -146,6 +174,18 @@ async function initDb() {
     // strategy (not every recipient may have published a key yet).
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS ciphertext TEXT;`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS nonce TEXT;`);
+    // E2EE (Phase 1.1 — multi-device): a message is now encrypted once per
+    // recipient DEVICE, not once per recipient ACCOUNT. `e2ee_recipients`
+    // holds a JSON array of { deviceId, ciphertext, nonce } — one entry for
+    // every device belonging to EITHER party (so the sender's other
+    // devices can also decrypt their own sent message on reload/live).
+    // `sender_device_id` records which device did the encrypting, so a
+    // reader knows whose public key to use to derive the shared secret.
+    // Legacy single-key `ciphertext`/`nonce` above are left as-is for old
+    // rows — never migrated, and may become permanently undecryptable if
+    // the key that produced them is gone. That's expected, not a bug.
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS e2ee_recipients JSONB;`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_device_id TEXT;`);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_messages_group_ts ON messages(group_id, timestamp);

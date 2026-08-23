@@ -18,10 +18,53 @@
 
 import nacl from 'tweetnacl';
 import * as naclUtil from 'tweetnacl-util';
+import { Capacitor } from '@capacitor/core';
 import { API_URL } from './config';
 
 const DB_NAME = 'aerio-e2ee';
 const STORE_NAME = 'keys';
+
+// ── Persistent per-installation device id (multi-device E2EE) ───────────
+// This is what actually distinguishes "Web" from "Android" as two separate
+// devices, even though both run the exact same Capacitor JS: each has its
+// own IndexedDB origin (browser vs WebView), so a device_id generated and
+// stored here is naturally scoped to one installation. Deliberately NOT
+// scoped per-account — a device keeps the same identity across logout/
+// login (see resetE2eeState: it never touches IndexedDB), and across
+// different accounts logging into the same installation, so it can be
+// used as a stable row key in the backend's device_keys table.
+const DEVICE_ID_RECORD = 'installation-device-id';
+let cachedDeviceId = null;
+
+function generateDeviceId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  // Fallback for environments without crypto.randomUUID.
+  return 'dev-' + naclUtil.encodeBase64(nacl.randomBytes(16)).replace(/[^a-zA-Z0-9]/g, '');
+}
+
+// Returns this installation's persistent device id, generating one the
+// very first time this app/browser runs. Never regenerated after that,
+// and never cleared on logout.
+export async function getOrCreateDeviceId() {
+  if (cachedDeviceId) return cachedDeviceId;
+  const stored = await idbGet(DEVICE_ID_RECORD);
+  if (stored && typeof stored === 'string') {
+    cachedDeviceId = stored;
+    return cachedDeviceId;
+  }
+  const id = generateDeviceId();
+  await idbSet(DEVICE_ID_RECORD, id);
+  cachedDeviceId = id;
+  return cachedDeviceId;
+}
+
+function currentPlatform() {
+  try {
+    return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android' ? 'android' : 'web';
+  } catch {
+    return 'web';
+  }
+}
 
 // Legacy (pre-fix) record name: a single IndexedDB key shared by every
 // account that ever logged into this browser. Kept around ONLY for the
@@ -152,24 +195,32 @@ export function getCachedPublicKeyBase64() {
 export function resetE2eeState() {
   cachedKeypair = null;
   cachedKeypairUserId = null;
-  publicKeyCache.clear();
+  deviceKeysCache.clear();
+  // Deliberately does NOT touch IndexedDB — device_id and every account's
+  // private key stay on disk across logout (see the requirements this
+  // module implements: a new device must not lose keys on logout, and a
+  // re-login on this same device must keep decrypting old history).
 }
 
-// ── Publishing / fetching public keys ────────────────────────────────────
+// ── Publishing / fetching device public keys (multi-device) ─────────────
 // IMPORTANT: this must check the response. Previously it fired the request
-// and ignored the result, so whenever the backend refused a mismatched key
-// (or any other publish error), this device silently kept using a private
-// key that no longer matched what was published for this account — every
-// decrypt then failed authentication (wrong key), both for incoming
-// messages and for the device's own sent history. Any failure here is
-// re-thrown so callers can log it (see the [e2ee] logging at the call
-// site) instead of the app believing publish succeeded when it didn't.
+// and ignored the result, so whenever the backend rejected a publish, this
+// device silently kept using a private key that no longer matched what was
+// published for this account — every decrypt then failed authentication,
+// both for incoming messages and for the device's own sent history. Any
+// failure here is re-thrown so callers can log it instead of the app
+// believing publish succeeded when it didn't.
 export async function publishPublicKey(token, userId) {
   const { publicKey } = await getOrCreateKeypair(userId);
+  const deviceId = await getOrCreateDeviceId();
   const res = await fetch(`${API_URL}/keys/publish`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ publicKey: naclUtil.encodeBase64(publicKey) }),
+    body: JSON.stringify({
+      publicKey: naclUtil.encodeBase64(publicKey),
+      deviceId,
+      platform: currentPlatform(),
+    }),
   });
   if (!res.ok) {
     let detail = '';
@@ -182,76 +233,94 @@ export async function publishPublicKey(token, userId) {
   if (body?.rotated) {
     // Safe to log: no key material or message content, just that this
     // device's key changed on the server (expected after fresh storage /
-    // a new device / a new deployment origin).
-    console.log('[e2ee] public key rotated for this account');
+    // a reinstall / a new deployment origin).
+    console.log(`[e2ee] public key rotated for this device (${deviceId})`);
   }
 }
 
-// Cache TTL for public key lookups. Short-lived, not permanent — the
-// previous version cached forever (including negative "no key yet"
-// results) for the life of the page/app session, via a plain Map with no
-// expiry. That meant: once a recipient's key was looked up, this device
-// kept using that same (possibly now-stale, post-rotation) copy for every
-// future message, in both directions, until a full reload cleared the
-// module state. That is a second, independent cause of "brand new
-// messages still fail to decrypt" even after the /api/keys/publish
-// rotation fix — a device open across a key rotation event just never
-// noticed. 60s balances not hammering the backend on every single message
-// in a chat history load against actually recovering when a key changes.
-const PUBLIC_KEY_CACHE_TTL_MS = 60_000;
-const publicKeyCache = new Map(); // userId -> { value: base64 | null, fetchedAt: number }
+// Cache TTL for device-key directory lookups. Short-lived, not permanent —
+// a plain forever-cache would mean a device that just rotated its key (or
+// a brand-new second device that just published for the first time) isn't
+// noticed by other sessions until a full reload. 60s balances not
+// hammering the backend on every message in a chat history load against
+// actually recovering when a device's key changes or a new device appears.
+const DEVICE_KEYS_CACHE_TTL_MS = 60_000;
+const deviceKeysCache = new Map(); // userId -> { devices, legacyPublicKey, fetchedAt }
 
-// Fetches another user's public key. Returns null if that user hasn't
-// published one yet — the caller should fall back to sending plaintext in
-// that case (see the E2EE migration notes: not every account will have a
-// key immediately after rollout).
+// Fetches every device key this user has published, plus the legacy
+// single-key column as a fallback for decrypting pre-migration messages.
+// Returns { devices: [{deviceId, publicKey, platform}], legacyPublicKey }.
+// Returns { devices: [], legacyPublicKey: null } if the user has no keys
+// published anywhere yet — the caller should fall back to plaintext in
+// that case (see the E2EE migration notes).
 //
 // Pass `forceRefresh: true` to bypass the cache entirely — used
 // immediately before encrypting a new outgoing message, so the sender
-// always encrypts against the recipient's CURRENT key rather than
+// always fans out to the recipient's CURRENT set of devices rather than
 // whatever was cached from an earlier lookup in this session.
-export async function fetchPublicKey(userId, token, { forceRefresh = false } = {}) {
-  const cached = publicKeyCache.get(userId);
-  const isFresh = cached && (Date.now() - cached.fetchedAt) < PUBLIC_KEY_CACHE_TTL_MS;
-  if (!forceRefresh && isFresh) return cached.value;
+export async function fetchDeviceKeys(userId, token, { forceRefresh = false } = {}) {
+  const cached = deviceKeysCache.get(userId);
+  const isFresh = cached && (Date.now() - cached.fetchedAt) < DEVICE_KEYS_CACHE_TTL_MS;
+  if (!forceRefresh && isFresh) return cached;
+  const empty = { devices: [], legacyPublicKey: null };
   try {
     const res = await fetch(`${API_URL}/keys/${userId}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    // Safe to log: user id + HTTP status + whether a key came back. Never
-    // the key contents.
-    console.log(`[e2ee] fetchPublicKey user=${userId} status=${res.status} hasKey=${res.ok ? undefined : false}`);
+    // Safe to log: user id + HTTP status + device count. Never key contents.
     if (!res.ok) {
-      publicKeyCache.set(userId, { value: null, fetchedAt: Date.now() });
-      return null;
+      console.log(`[e2ee] fetchDeviceKeys user=${userId} status=${res.status}`);
+      deviceKeysCache.set(userId, { ...empty, fetchedAt: Date.now() });
+      return empty;
     }
     const data = await res.json();
-    const value = data.publicKey || null;
-    console.log(`[e2ee] fetchPublicKey user=${userId} status=${res.status} hasKey=${!!value}`);
-    publicKeyCache.set(userId, { value, fetchedAt: Date.now() });
+    const value = {
+      devices: Array.isArray(data.devices) ? data.devices : [],
+      legacyPublicKey: data.legacyPublicKey || null,
+      fetchedAt: Date.now(),
+    };
+    console.log(`[e2ee] fetchDeviceKeys user=${userId} status=${res.status} deviceCount=${value.devices.length}`);
+    deviceKeysCache.set(userId, value);
     return value;
   } catch (e) {
-    console.warn(`[e2ee] fetchPublicKey network error for user=${userId}:`, e && e.message ? e.message : e);
+    console.warn(`[e2ee] fetchDeviceKeys network error for user=${userId}:`, e && e.message ? e.message : e);
     // Network failure: fall back to a possibly-stale cached value rather
-    // than treating the recipient as keyless, but only if we have one.
-    return cached ? cached.value : null;
+    // than treating the user as keyless, but only if we have one.
+    return cached || empty;
   }
 }
 
 // ── Encrypt / decrypt ─────────────────────────────────────────────────────
-// Encrypts `plaintext` for `recipientPublicKeyB64` using this device's
-// private key. Returns { ciphertext, nonce } both base64, ready to send to
-// the backend as opaque blobs it cannot read.
-export async function encryptForRecipient(plaintext, recipientPublicKeyB64, userId) {
+// Encrypts `plaintext` once per target device, using THIS device's private
+// key. `targetDevices` is the combined device list of both the recipient
+// AND the sender's own other devices/accounts-on-this-device, so every one
+// of them (including this same device, for a consistent reload experience)
+// ends up able to read the message. Returns an array of
+// { deviceId, ciphertext, nonce } ready to send to the backend as opaque
+// blobs it cannot read — a fresh nonce is generated for every entry.
+export async function encryptForDevices(plaintext, targetDevices, userId) {
   const { secretKey } = await getOrCreateKeypair(userId);
-  const recipientPublicKey = naclUtil.decodeBase64(recipientPublicKeyB64);
-  const nonce = nacl.randomBytes(nacl.box.nonceLength);
   const messageBytes = naclUtil.decodeUTF8(plaintext);
-  const box = nacl.box(messageBytes, nonce, recipientPublicKey, secretKey);
-  return {
-    ciphertext: naclUtil.encodeBase64(box),
-    nonce: naclUtil.encodeBase64(nonce),
-  };
+  return targetDevices
+    .filter(d => d && d.deviceId && d.publicKey)
+    .map((d) => {
+      const recipientPublicKey = naclUtil.decodeBase64(d.publicKey);
+      const nonce = nacl.randomBytes(nacl.box.nonceLength);
+      const box = nacl.box(messageBytes, nonce, recipientPublicKey, secretKey);
+      return {
+        deviceId: d.deviceId,
+        ciphertext: naclUtil.encodeBase64(box),
+        nonce: naclUtil.encodeBase64(nonce),
+      };
+    });
+}
+
+// Picks the payload entry meant for THIS device out of a message's
+// multi-device recipients array. Returns null if this device isn't in the
+// list (e.g. a message sent before this device existed/published a key).
+export function pickPayloadForDevice(recipientsArray, deviceId) {
+  if (!Array.isArray(recipientsArray)) return null;
+  return recipientsArray.find(r => r && r.deviceId === deviceId) || null;
 }
 
 // Decrypts a message that was encrypted for us by `senderPublicKeyB64`.
@@ -260,7 +329,7 @@ export async function encryptForRecipient(plaintext, recipientPublicKeyB64, user
 // should show a fallback like "Unable to decrypt this message" rather
 // than crash, since a failed decrypt is a real possibility (e.g. a
 // message from before this device had a key, or a key change).
-export async function decryptFromSender(ciphertextB64, nonceB64, senderPublicKeyB64, userId) {
+export async function decryptFromSenderDevice(ciphertextB64, nonceB64, senderPublicKeyB64, userId) {
   try {
     const { secretKey } = await getOrCreateKeypair(userId);
     const senderPublicKey = naclUtil.decodeBase64(senderPublicKeyB64);
