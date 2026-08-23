@@ -1748,62 +1748,79 @@ app.get('/api/system/info', authenticateToken, (req, res) => {
 // for encrypting a message TO this user, never for decrypting messages
 // FROM this user or anyone else. The matching private key never reaches
 // this server in any request handler, anywhere in this file.
+// Publish/republish THIS device's key. Requires a persistent, per-
+// installation `deviceId` from the client (see crypto.js getOrCreateDeviceId).
+// Upserts by (device_id, user_id) — this is the actual multi-device fix:
+// a second device for the same account gets its OWN row and can never
+// overwrite the first device's row.
 app.post('/api/keys/publish', authenticateToken, async (req, res) => {
-  const { publicKey } = req.body || {};
+  const { publicKey, deviceId, platform } = req.body || {};
   if (!publicKey || typeof publicKey !== 'string' || publicKey.length > 200) {
     return res.status(400).json({ error: 'A valid publicKey is required' });
   }
+  if (!deviceId || typeof deviceId !== 'string' || deviceId.length > 200) {
+    return res.status(400).json({ error: 'A valid deviceId is required' });
+  }
+  const safePlatform = (typeof platform === 'string' && ['web', 'android'].includes(platform)) ? platform : 'web';
   try {
-    const { rows } = await db.query('SELECT public_key FROM users WHERE id = $1', [req.user.id]);
+    const { rows } = await db.query(
+      'SELECT public_key FROM device_keys WHERE device_id = $1 AND user_id = $2',
+      [deviceId, req.user.id]
+    );
     const existing = rows[0] ? rows[0].public_key : null;
-
-    // Publish/republish this authenticated device's key. This runs on every
-    // login and is idempotent when the key hasn't changed.
-    //
-    // When the key HAS changed (new device, cleared browser storage, a
-    // fresh Vercel preview URL giving IndexedDB a brand-new empty origin,
-    // reinstalling the Android app, etc.) we allow the rotation instead of
-    // rejecting it. This request is already authenticated as this account
-    // (valid JWT for req.user.id) — refusing the rotation added no real
-    // protection, since anyone holding that token can already read/send as
-    // this account via the API, but it DID mean an orphaned key could stay
-    // pinned forever with no client-visible error (the old publish call
-    // silently ignored a 409), permanently breaking encrypt/decrypt in
-    // both directions for this account. Rotating is a normal, expected
-    // E2EE event, the same as reinstalling Signal/WhatsApp: messages
-    // encrypted under the previous key can no longer be decrypted after
-    // rotation — that's inherent to E2EE, not a bug — but every message
-    // from this point forward encrypts/decrypts correctly again.
     const rotated = !!existing && existing !== publicKey;
-    if (existing !== publicKey) {
-      await db.query('UPDATE users SET public_key = $1 WHERE id = $2', [publicKey, req.user.id]);
-      if (rotated) {
-        // Safe to log: user id + that a rotation happened. Never log key
-        // material or message content.
-        console.log(`[e2ee] public key rotated for user ${req.user.id}`);
-      }
-    }
-    console.log(`[e2ee] POST /keys/publish user=${req.user.id} status=200 rotated=${rotated}`);
-    return res.json({ ok: true, publicKey, rotated });
+
+    await db.query(
+      `INSERT INTO device_keys (device_id, user_id, public_key, platform, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (device_id, user_id)
+       DO UPDATE SET public_key = EXCLUDED.public_key, platform = EXCLUDED.platform, updated_at = NOW()`,
+      [deviceId, req.user.id, publicKey, safePlatform]
+    );
+
+    // Also keep the legacy single-key column loosely in sync so any client
+    // still on the old contract (pre-multi-device) has *something* to read
+    // during a staged rollout. Never treated as authoritative by new code.
+    await db.query('UPDATE users SET public_key = $1 WHERE id = $2', [publicKey, req.user.id]).catch(() => {});
+
+    // Safe to log: user id, device id, rotated flag. Never key material.
+    if (rotated) console.log(`[e2ee] public key rotated for user=${req.user.id} device=${deviceId}`);
+    console.log(`[e2ee] POST /keys/publish user=${req.user.id} device=${deviceId} platform=${safePlatform} status=200 rotated=${rotated}`);
+    return res.json({ ok: true, deviceId, rotated });
   } catch (err) {
-    console.error(`[e2ee] Failed to publish key for user ${req.user.id}:`, err.message);
-    console.log(`[e2ee] POST /keys/publish user=${req.user.id} status=500`);
+    console.error(`[e2ee] Failed to publish key for user=${req.user.id} device=${deviceId}:`, err.message);
+    console.log(`[e2ee] POST /keys/publish user=${req.user.id} device=${deviceId} status=500`);
     return res.status(500).json({ error: 'Failed to publish key' });
   }
 });
 
+// Returns every device this user has published a key from — the client
+// fans out encryption to all of them. `legacyPublicKey` is included only
+// as a fallback for decrypting pre-migration messages that still carry
+// the old single ciphertext/nonce shape.
 app.get('/api/keys/:userId', authenticateToken, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isFinite(userId)) return res.status(400).json({ error: 'Invalid userId' });
   try {
-    const { rows } = await db.query('SELECT public_key FROM users WHERE id = $1', [userId]);
-    if (!rows[0]) {
+    const [userRow, deviceRows] = await Promise.all([
+      db.query('SELECT public_key FROM users WHERE id = $1', [userId]),
+      db.query('SELECT device_id, public_key, platform FROM device_keys WHERE user_id = $1 ORDER BY updated_at DESC', [userId]),
+    ]);
+    if (!userRow.rows[0]) {
       console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=404`);
       return res.status(404).json({ error: 'User not found' });
     }
-    const hasKey = !!rows[0].public_key;
-    console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=200 hasKey=${hasKey}`);
-    res.json({ userId, publicKey: rows[0].public_key || null });
+    const devices = (deviceRows.rows || []).map(r => ({
+      deviceId: r.device_id,
+      publicKey: r.public_key,
+      platform: r.platform,
+    }));
+    console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=200 deviceCount=${devices.length}`);
+    res.json({
+      userId,
+      devices,
+      legacyPublicKey: userRow.rows[0].public_key || null,
+    });
   } catch (err) {
     console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=500`);
     return res.status(500).json({ error: 'Failed to fetch key' });
@@ -2141,11 +2158,13 @@ app.get('/api/messages/:userId/:friendOrGroupId', authenticateToken, async (req,
 
   try {
     const { rows } = await db.query(query, params);
-    // Safe diagnostic log: counts + booleans only — never ciphertext,
-    // nonce, or plaintext content. Confirms ciphertext/nonce survive the
-    // round trip through the DB unchanged (non-null in, non-null out).
-    const e2eeCount = (rows || []).filter(r => r.ciphertext && r.nonce).length;
-    console.log(`[e2ee] GET /messages/${userId}/${friendOrGroupId} isGroup=${isGroup} returned=${(rows || []).length} withCiphertext=${e2eeCount}`);
+    // Safe diagnostic log: counts only — never ciphertext, nonce, or
+    // plaintext content. Confirms e2ee_recipients survive the round trip
+    // through the DB unchanged (non-null in, non-null out). Also counts
+    // legacy single-key rows (pre multi-device) separately.
+    const e2eeCount = (rows || []).filter(r => r.e2ee_recipients).length;
+    const legacyE2eeCount = (rows || []).filter(r => !r.e2ee_recipients && r.ciphertext && r.nonce).length;
+    console.log(`[e2ee] GET /messages/${userId}/${friendOrGroupId} isGroup=${isGroup} returned=${(rows || []).length} withE2eeRecipients=${e2eeCount} legacySingleKey=${legacyE2eeCount}`);
     const ids = (rows || []).map(r => r.id).filter(Boolean);
     const reactionsByMessageId = {};
     if (ids.length) {
@@ -2574,24 +2593,30 @@ io.on('connection', (socket) => {
     try {
       if (!data || typeof data !== 'object') return;
       const senderId = socket.user.id;
-      const { receiverId, groupId, content, imageUrl, type, reply, viewOnce, ciphertext, nonce } = data;
+      const { receiverId, groupId, content, imageUrl, type, reply, viewOnce, recipients, senderDeviceId } = data;
 
       let msgType = type || 'text';
       let valReceiverId = groupId ? null : receiverId;
-      // E2EE (direct messages only): if the client already encrypted this
-      // message client-side, `ciphertext`/`nonce` are set and `content` is
-      // intentionally absent — the server stores the ciphertext and never
+      // E2EE multi-device (direct messages only): the client fans out
+      // encryption client-side to every device of both parties, so
+      // `recipients` is an array of { deviceId, ciphertext, nonce } and
+      // `senderDeviceId` names which device did the encrypting (so a
+      // reader knows whose public key to use). `content` is intentionally
+      // absent for these — the server stores only ciphertext and never
       // sees plaintext. Falls back to plaintext `content` for group chats
-      // (Phase 2, not yet encrypted) or if either side hasn't published a
-      // key yet — see the E2EE migration notes.
-      const isE2ee = !groupId && !!ciphertext && !!nonce;
+      // (Phase 2, not yet encrypted) or if either side hasn't published any
+      // device key yet — see the E2EE migration notes.
+      const validRecipients = Array.isArray(recipients)
+        ? recipients.filter(r => r && typeof r.deviceId === 'string' && typeof r.ciphertext === 'string' && typeof r.nonce === 'string')
+        : [];
+      const isE2ee = !groupId && validRecipients.length > 0 && typeof senderDeviceId === 'string' && !!senderDeviceId;
       const text = content == null ? '' : String(content);
       const media = imageUrl || null;
       const isViewOnce = !!viewOnce && msgType === 'image' && !!media;
 
-      // Safe diagnostic log: ids + booleans only — never ciphertext,
+      // Safe diagnostic log: ids + counts/booleans only — never ciphertext,
       // nonce, or plaintext content.
-      console.log(`[e2ee] send_message sender=${senderId} receiver=${valReceiverId || 'null'} group=${groupId || 'null'} isE2ee=${isE2ee} hasCiphertext=${!!ciphertext} hasNonce=${!!nonce}`);
+      console.log(`[e2ee] send_message sender=${senderId} receiver=${valReceiverId || 'null'} group=${groupId || 'null'} isE2ee=${isE2ee} senderDevice=${isE2ee ? senderDeviceId : 'null'} recipientDeviceCount=${validRecipients.length}`);
 
       if (!groupId && !valReceiverId) return;
       if (!isE2ee && !text.trim() && !media) return;
@@ -2631,18 +2656,20 @@ io.on('connection', (socket) => {
                 sender_id, receiver_id, group_id,
                 content, image_url, type,
                 reply_to_id, reply_to_type, reply_to_content, reply_to_image_url, reply_to_sender_username,
-                status, view_once, ciphertext, nonce
+                status, view_once, e2ee_recipients, sender_device_id
              ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
              RETURNING id, timestamp`,
             [
               senderId, valReceiverId, groupId || null,
               isE2ee ? null : text, media, msgType,
               replyToId, replyToType, replyToContent, replyToImageUrl, replyToSenderUsername,
-              'sent', isViewOnce, isE2ee ? ciphertext : null, isE2ee ? nonce : null
+              'sent', isViewOnce,
+              isE2ee ? JSON.stringify(validRecipients.map(r => ({ deviceId: r.deviceId, ciphertext: r.ciphertext, nonce: r.nonce }))) : null,
+              isE2ee ? senderDeviceId : null
             ]
           );
           const row = inserted.rows[0];
-          console.log(`[e2ee] message stored id=${row.id} sender=${senderId} receiver=${valReceiverId || 'null'} isE2ee=${isE2ee} hasCiphertext=${!!(isE2ee ? ciphertext : null)} hasNonce=${!!(isE2ee ? nonce : null)}`);
+          console.log(`[e2ee] message stored id=${row.id} sender=${senderId} receiver=${valReceiverId || 'null'} isE2ee=${isE2ee} recipientDeviceCount=${isE2ee ? validRecipients.length : 0}`);
 
           const senderRow = await db.query('SELECT username, display_name, avatar_url FROM users WHERE id = $1', [senderId]);
           const senderInfo = senderRow.rows[0] || {};
@@ -2654,8 +2681,8 @@ io.on('connection', (socket) => {
             receiver_id: valReceiverId,
             group_id: groupId || null,
             content: isE2ee ? null : text,
-            ciphertext: isE2ee ? ciphertext : null,
-            nonce: isE2ee ? nonce : null,
+            e2ee_recipients: isE2ee ? validRecipients : null,
+            sender_device_id: isE2ee ? senderDeviceId : null,
             // View-once images are never broadcast with their real URL —
             // recipients must fetch it exactly once via the dedicated
             // /api/messages/:id/view-once/open endpoint.
@@ -2681,6 +2708,14 @@ io.on('connection', (socket) => {
           } else {
             io.to(`user_${receiverId}`).emit('receive_message', messageObj);
             socket.emit('message_sent', messageObj);
+            // E2EE multi-device: the sender may be logged in on other
+            // devices too (e.g. sent from Android, also open on Web).
+            // Those other sessions didn't send this message and won't get
+            // 'message_sent', so give them a live copy the same way the
+            // receiver gets one. `socket.to()` (not `io.to()`) deliberately
+            // excludes the sending socket itself, which already has the
+            // plaintext locally and got 'message_sent' above.
+            socket.to(`user_${senderId}`).emit('receive_message', messageObj);
 
             const receiverRoom = io.sockets.adapter.rooms.get(`user_${receiverId}`);
             const receiverOnline = receiverRoom && receiverRoom.size > 0;
