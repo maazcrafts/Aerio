@@ -485,8 +485,18 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
     if (msgObj.group_id || !msgObj.ciphertext || !msgObj.nonce) return msgObj;
     const otherPartyId = Number(msgObj.sender_id) === Number(user.id) ? msgObj.receiver_id : msgObj.sender_id;
     const otherPartyKey = await fetchPublicKey(otherPartyId, user.token);
-    if (!otherPartyKey) return { ...msgObj, content: '[Unable to decrypt — key unavailable]' };
+    // Safe diagnostic log: ids + booleans only — never key material,
+    // ciphertext, nonce, or plaintext.
+    console.log(`[e2ee] decrypt attempt message=${msgObj.id} sender=${msgObj.sender_id} receiver=${msgObj.receiver_id} otherPartyKeyFound=${!!otherPartyKey}`);
+    if (!otherPartyKey) {
+      console.warn(`[e2ee] decrypt skipped: no public key on file for user ${otherPartyId} (message ${msgObj.id})`);
+      return { ...msgObj, content: '[Unable to decrypt — key unavailable]' };
+    }
     const plaintext = await decryptFromSender(msgObj.ciphertext, msgObj.nonce, otherPartyKey, user.id);
+    console.log(`[e2ee] decrypt result message=${msgObj.id} sender=${msgObj.sender_id} receiver=${msgObj.receiver_id} success=${plaintext !== null}`);
+    if (plaintext === null) {
+      console.warn(`[e2ee] decrypt failed (key mismatch or corrupted ciphertext): message ${msgObj.id}, other party ${otherPartyId}`);
+    }
     return { ...msgObj, content: plaintext !== null ? plaintext : '[Unable to decrypt this message]' };
   };
 
@@ -1652,7 +1662,12 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
       let ciphertext = null, nonce = null;
       if (!activeChat.is_group && content) {
         try {
-          const recipientKey = await fetchPublicKey(activeChat.id, user.token);
+          // forceRefresh: always encrypt against the recipient's CURRENT
+          // key, not a possibly-stale cached one from earlier in this
+          // session (see the fetchPublicKey cache-TTL comment in crypto.js
+          // — this is what "immediately before encrypting" means).
+          const recipientKey = await fetchPublicKey(activeChat.id, user.token, { forceRefresh: true });
+          console.log(`[e2ee] send: recipient=${activeChat.id} hasKey=${!!recipientKey}`);
           if (recipientKey) {
             const enc = await encryptForRecipient(content, recipientKey, user.id);
             ciphertext = enc.ciphertext;

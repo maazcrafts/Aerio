@@ -156,33 +156,85 @@ export function resetE2eeState() {
 }
 
 // ── Publishing / fetching public keys ────────────────────────────────────
+// IMPORTANT: this must check the response. Previously it fired the request
+// and ignored the result, so whenever the backend refused a mismatched key
+// (or any other publish error), this device silently kept using a private
+// key that no longer matched what was published for this account — every
+// decrypt then failed authentication (wrong key), both for incoming
+// messages and for the device's own sent history. Any failure here is
+// re-thrown so callers can log it (see the [e2ee] logging at the call
+// site) instead of the app believing publish succeeded when it didn't.
 export async function publishPublicKey(token, userId) {
   const { publicKey } = await getOrCreateKeypair(userId);
-  await fetch(`${API_URL}/keys/publish`, {
+  const res = await fetch(`${API_URL}/keys/publish`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ publicKey: naclUtil.encodeBase64(publicKey) }),
   });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json())?.error || ''; } catch (_) { /* non-JSON error body */ }
+    // Never include key material in the thrown error — status + server
+    // message only.
+    throw new Error(`Failed to publish public key (HTTP ${res.status})${detail ? `: ${detail}` : ''}`);
+  }
+  const body = await res.json().catch(() => null);
+  if (body?.rotated) {
+    // Safe to log: no key material or message content, just that this
+    // device's key changed on the server (expected after fresh storage /
+    // a new device / a new deployment origin).
+    console.log('[e2ee] public key rotated for this account');
+  }
 }
 
-const publicKeyCache = new Map(); // userId -> base64 public key | null
+// Cache TTL for public key lookups. Short-lived, not permanent — the
+// previous version cached forever (including negative "no key yet"
+// results) for the life of the page/app session, via a plain Map with no
+// expiry. That meant: once a recipient's key was looked up, this device
+// kept using that same (possibly now-stale, post-rotation) copy for every
+// future message, in both directions, until a full reload cleared the
+// module state. That is a second, independent cause of "brand new
+// messages still fail to decrypt" even after the /api/keys/publish
+// rotation fix — a device open across a key rotation event just never
+// noticed. 60s balances not hammering the backend on every single message
+// in a chat history load against actually recovering when a key changes.
+const PUBLIC_KEY_CACHE_TTL_MS = 60_000;
+const publicKeyCache = new Map(); // userId -> { value: base64 | null, fetchedAt: number }
 
-// Fetches (and caches) another user's public key. Returns null if that
-// user hasn't published one yet — the caller should fall back to sending
-// plaintext in that case (see the E2EE migration notes: not every account
-// will have a key immediately after rollout).
-export async function fetchPublicKey(userId, token) {
-  if (publicKeyCache.has(userId)) return publicKeyCache.get(userId);
+// Fetches another user's public key. Returns null if that user hasn't
+// published one yet — the caller should fall back to sending plaintext in
+// that case (see the E2EE migration notes: not every account will have a
+// key immediately after rollout).
+//
+// Pass `forceRefresh: true` to bypass the cache entirely — used
+// immediately before encrypting a new outgoing message, so the sender
+// always encrypts against the recipient's CURRENT key rather than
+// whatever was cached from an earlier lookup in this session.
+export async function fetchPublicKey(userId, token, { forceRefresh = false } = {}) {
+  const cached = publicKeyCache.get(userId);
+  const isFresh = cached && (Date.now() - cached.fetchedAt) < PUBLIC_KEY_CACHE_TTL_MS;
+  if (!forceRefresh && isFresh) return cached.value;
   try {
     const res = await fetch(`${API_URL}/keys/${userId}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!res.ok) { publicKeyCache.set(userId, null); return null; }
+    // Safe to log: user id + HTTP status + whether a key came back. Never
+    // the key contents.
+    console.log(`[e2ee] fetchPublicKey user=${userId} status=${res.status} hasKey=${res.ok ? undefined : false}`);
+    if (!res.ok) {
+      publicKeyCache.set(userId, { value: null, fetchedAt: Date.now() });
+      return null;
+    }
     const data = await res.json();
-    publicKeyCache.set(userId, data.publicKey || null);
-    return data.publicKey || null;
-  } catch {
-    return null;
+    const value = data.publicKey || null;
+    console.log(`[e2ee] fetchPublicKey user=${userId} status=${res.status} hasKey=${!!value}`);
+    publicKeyCache.set(userId, { value, fetchedAt: Date.now() });
+    return value;
+  } catch (e) {
+    console.warn(`[e2ee] fetchPublicKey network error for user=${userId}:`, e && e.message ? e.message : e);
+    // Network failure: fall back to a possibly-stale cached value rather
+    // than treating the recipient as keyless, but only if we have one.
+    return cached ? cached.value : null;
   }
 }
 

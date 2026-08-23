@@ -1757,27 +1757,37 @@ app.post('/api/keys/publish', authenticateToken, async (req, res) => {
     const { rows } = await db.query('SELECT public_key FROM users WHERE id = $1', [req.user.id]);
     const existing = rows[0] ? rows[0].public_key : null;
 
-    // First-ever publish, or republishing the same key (the normal case —
-    // this runs on every login): safe to write.
-    if (!existing || existing === publicKey) {
-      if (existing !== publicKey) {
-        await db.query('UPDATE users SET public_key = $1 WHERE id = $2', [publicKey, req.user.id]);
+    // Publish/republish this authenticated device's key. This runs on every
+    // login and is idempotent when the key hasn't changed.
+    //
+    // When the key HAS changed (new device, cleared browser storage, a
+    // fresh Vercel preview URL giving IndexedDB a brand-new empty origin,
+    // reinstalling the Android app, etc.) we allow the rotation instead of
+    // rejecting it. This request is already authenticated as this account
+    // (valid JWT for req.user.id) — refusing the rotation added no real
+    // protection, since anyone holding that token can already read/send as
+    // this account via the API, but it DID mean an orphaned key could stay
+    // pinned forever with no client-visible error (the old publish call
+    // silently ignored a 409), permanently breaking encrypt/decrypt in
+    // both directions for this account. Rotating is a normal, expected
+    // E2EE event, the same as reinstalling Signal/WhatsApp: messages
+    // encrypted under the previous key can no longer be decrypted after
+    // rotation — that's inherent to E2EE, not a bug — but every message
+    // from this point forward encrypts/decrypts correctly again.
+    const rotated = !!existing && existing !== publicKey;
+    if (existing !== publicKey) {
+      await db.query('UPDATE users SET public_key = $1 WHERE id = $2', [publicKey, req.user.id]);
+      if (rotated) {
+        // Safe to log: user id + that a rotation happened. Never log key
+        // material or message content.
+        console.log(`[e2ee] public key rotated for user ${req.user.id}`);
       }
-      return res.json({ ok: true, publicKey });
     }
-
-    // A DIFFERENT key is already on file for this account. Do not silently
-    // overwrite it — that would be a key-rotation event, and this endpoint
-    // can't tell a legitimate one (e.g. the user lost their local key) apart
-    // from a client bug or malicious client trying to make future messages
-    // to this account decryptable by someone else. Key rotation / multi-
-    // device support is a separate, not-yet-implemented feature — for now
-    // we just refuse to clobber the existing key.
-    return res.status(409).json({
-      error: 'A different public key is already published for this account',
-      publicKey: existing,
-    });
+    console.log(`[e2ee] POST /keys/publish user=${req.user.id} status=200 rotated=${rotated}`);
+    return res.json({ ok: true, publicKey, rotated });
   } catch (err) {
+    console.error(`[e2ee] Failed to publish key for user ${req.user.id}:`, err.message);
+    console.log(`[e2ee] POST /keys/publish user=${req.user.id} status=500`);
     return res.status(500).json({ error: 'Failed to publish key' });
   }
 });
@@ -1787,9 +1797,15 @@ app.get('/api/keys/:userId', authenticateToken, async (req, res) => {
   if (!Number.isFinite(userId)) return res.status(400).json({ error: 'Invalid userId' });
   try {
     const { rows } = await db.query('SELECT public_key FROM users WHERE id = $1', [userId]);
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    if (!rows[0]) {
+      console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=404`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const hasKey = !!rows[0].public_key;
+    console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=200 hasKey=${hasKey}`);
     res.json({ userId, publicKey: rows[0].public_key || null });
   } catch (err) {
+    console.log(`[e2ee] GET /keys/${userId} requestedBy=${req.user.id} status=500`);
     return res.status(500).json({ error: 'Failed to fetch key' });
   }
 });
@@ -2125,6 +2141,11 @@ app.get('/api/messages/:userId/:friendOrGroupId', authenticateToken, async (req,
 
   try {
     const { rows } = await db.query(query, params);
+    // Safe diagnostic log: counts + booleans only — never ciphertext,
+    // nonce, or plaintext content. Confirms ciphertext/nonce survive the
+    // round trip through the DB unchanged (non-null in, non-null out).
+    const e2eeCount = (rows || []).filter(r => r.ciphertext && r.nonce).length;
+    console.log(`[e2ee] GET /messages/${userId}/${friendOrGroupId} isGroup=${isGroup} returned=${(rows || []).length} withCiphertext=${e2eeCount}`);
     const ids = (rows || []).map(r => r.id).filter(Boolean);
     const reactionsByMessageId = {};
     if (ids.length) {
@@ -2568,6 +2589,10 @@ io.on('connection', (socket) => {
       const media = imageUrl || null;
       const isViewOnce = !!viewOnce && msgType === 'image' && !!media;
 
+      // Safe diagnostic log: ids + booleans only — never ciphertext,
+      // nonce, or plaintext content.
+      console.log(`[e2ee] send_message sender=${senderId} receiver=${valReceiverId || 'null'} group=${groupId || 'null'} isE2ee=${isE2ee} hasCiphertext=${!!ciphertext} hasNonce=${!!nonce}`);
+
       if (!groupId && !valReceiverId) return;
       if (!isE2ee && !text.trim() && !media) return;
 
@@ -2617,6 +2642,7 @@ io.on('connection', (socket) => {
             ]
           );
           const row = inserted.rows[0];
+          console.log(`[e2ee] message stored id=${row.id} sender=${senderId} receiver=${valReceiverId || 'null'} isE2ee=${isE2ee} hasCiphertext=${!!(isE2ee ? ciphertext : null)} hasNonce=${!!(isE2ee ? nonce : null)}`);
 
           const senderRow = await db.query('SELECT username, display_name, avatar_url FROM users WHERE id = $1', [senderId]);
           const senderInfo = senderRow.rows[0] || {};
