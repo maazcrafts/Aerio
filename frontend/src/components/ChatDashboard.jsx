@@ -9,6 +9,7 @@ import {
   Phone, PhoneOff, Video, VideoOff, SwitchCamera, Volume1, Volume2
 } from 'lucide-react';
 const EmojiPicker = lazy(() => import('emoji-picker-react'));
+import { App as CapApp } from '@capacitor/app';   // ← add this line
 import { API_URL, SOCKET_URL, API_BASE_URL, TURN_ICE_SERVER } from '../config';
 import ProfileModal from './ProfileModal';
 import UserProfileModal from './UserProfileModal';
@@ -979,6 +980,31 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
+    useEffect(() => {
+    const onVisibilityChange = async () => {
+      if (document.visibilityState === 'visible' && callStateRef.current === 'connected' && !wakeLockRef.current && 'wakeLock' in navigator) {
+        try { wakeLockRef.current = await navigator.wakeLock.request('screen'); } catch (_) { }
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
+  // ← ADD THE NEW EFFECT HERE
+  useEffect(() => {
+    const subPromise = CapApp.addListener('appStateChange', ({ isActive }) => {
+      if (!socket || !socket.connected) return;
+      if (isActive) {
+        socket.emit('active_chat', activeChatRef.current
+          ? { isGroup: !!activeChatRef.current.is_group, targetId: activeChatRef.current.id }
+          : {});
+      } else {
+        socket.emit('active_chat', {});
+      }
+    });
+    return () => { subPromise.then(sub => sub.remove()); };
   }, []);
 
   const [showGifPicker, setShowGifPicker] = useState(false);
