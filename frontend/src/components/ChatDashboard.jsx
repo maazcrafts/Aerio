@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
 import axios from 'axios';
 import { io } from 'socket.io-client';
 import { Link } from 'react-router-dom';
@@ -6,7 +6,7 @@ import {
   Send, UserPlus, LogOut, Users, Image as ImageIcon, X, Check, CheckCircle, XCircle,
   ArrowLeft, Mic, MicOff, Reply as ReplyIcon, Play, Pause, Shield, Settings, Star, Pin,
   Search, Edit3, Trash2, Copy, Forward, Bell, Download, Lock, Sticker,
-  Phone, PhoneOff, Video, VideoOff, SwitchCamera, Volume1, Volume2
+  Phone, PhoneOff, Video, VideoOff, SwitchCamera, Volume1, Volume2, Sparkles
 } from 'lucide-react';
 const EmojiPicker = lazy(() => import('emoji-picker-react'));
 import { API_URL, SOCKET_URL, API_BASE_URL, TURN_ICE_SERVER } from '../config';
@@ -576,6 +576,10 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
   const [showGroupModal, setShowGroupModal] = useState(false);
   const [showFriendRequestsModal, setShowFriendRequestsModal] = useState(false);
   const [showGroupDetailsModal, setShowGroupDetailsModal] = useState(false);
+  // Catch me up: compact summary picker for chats with 5+ unread messages.
+  const [showCatchMeUpModal, setShowCatchMeUpModal] = useState(false);
+  const [catchMeUpSelected, setCatchMeUpSelected] = useState(() => new Set());
+  const [catchMeUpStep, setCatchMeUpStep] = useState('select'); // 'select' | 'summary'
   const [viewingUserId, setViewingUserId] = useState(null);
   const [newGroupName, setNewGroupName] = useState('');
   const [newGroupDesc, setNewGroupDesc] = useState('');
@@ -602,6 +606,19 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
   const recordedAudioUrlRef = useRef(null);
   const [unreadCounts, setUnreadCounts] = useState({});
   const activeChatRef = useRef(null);
+  // Catch me up qualifies a chat once it has 5+ unread messages. Reuses the
+  // existing unreadCounts tracking above — no separate unread system.
+  const CATCH_ME_UP_THRESHOLD = 5;
+  const catchMeUpChats = useMemo(() => {
+    const items = [
+      ...groups.map(g => ({ key: `group_${g.id}`, id: g.id, is_group: true, name: g.name, chat: { ...g, is_group: true } })),
+      ...contacts.map(c => ({ key: `user_${c.id}`, id: c.id, is_group: false, name: c.display_name || c.username, chat: c })),
+    ];
+    return items
+      .map(item => ({ ...item, unread: unreadCounts[item.key] || 0 }))
+      .filter(item => item.unread >= CATCH_ME_UP_THRESHOLD)
+      .sort((a, b) => b.unread - a.unread);
+  }, [groups, contacts, unreadCounts]);
   const notificationSoundsRef = useRef(userSettings.notification_sounds);
   const localSettingsRef = useRef(getLocalSettings(user?.id));
   const messagesEndRef = useRef(null);
@@ -2495,6 +2512,9 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
                   <button className="logout-btn" onClick={() => setShowSearch(!showSearch)} title="Search Messages">
                     <Search size={18} />
                   </button>
+                  <button className="logout-btn" onClick={() => setActiveChat(null)} title="Close chat">
+                    <X size={18} />
+                  </button>
                 </div>
               </div>
               {showSearch && (
@@ -2848,12 +2868,95 @@ const ChatDashboard = ({ user, setUser, userSettings, settingsLoading, onSetting
               </div>
             </>
           ) : (
-            <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
-              Select a friend or group to start chatting
+            <div className="aerio-home">
+              <h2 className="aerio-home-title">Welcome back</h2>
+              <p className="aerio-home-subtitle">Select a conversation to start chatting</p>
+              {catchMeUpChats.length > 0 && (
+                <button
+                  type="button"
+                  className="catch-me-up-card"
+                  onClick={() => {
+                    setCatchMeUpSelected(new Set(catchMeUpChats.map(item => item.key)));
+                    setCatchMeUpStep('select');
+                    setShowCatchMeUpModal(true);
+                  }}
+                >
+                  <Sparkles size={16} />
+                  <span>
+                    <strong>Catch me up</strong>
+                    <small>Review conversations you missed</small>
+                  </span>
+                </button>
+              )}
             </div>
           )}
         </div>
       </div>
+      {showCatchMeUpModal && (
+        <div className="modal-overlay" onClick={() => setShowCatchMeUpModal(false)}>
+          <div className="modal-content catch-me-up-modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Catch me up</h3>
+              <button type="button" className="close-btn" onClick={() => setShowCatchMeUpModal(false)}><X size={20} /></button>
+            </div>
+            {catchMeUpStep === 'select' ? (
+              <>
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>Choose conversations to summarize</p>
+                <div className="multi-select-list">
+                  {catchMeUpChats.map(item => {
+                    const isSelected = catchMeUpSelected.has(item.key);
+                    return (
+                      <div
+                        key={item.key}
+                        className="select-item"
+                        onClick={() => {
+                          setCatchMeUpSelected(prev => {
+                            const next = new Set(prev);
+                            if (next.has(item.key)) next.delete(item.key);
+                            else next.add(item.key);
+                            return next;
+                          });
+                        }}
+                      >
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                          <input type="checkbox" checked={isSelected} readOnly style={{ accentColor: 'var(--primary)' }} />
+                          <span>{item.name}</span>
+                        </span>
+                        <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{item.unread} unread messages</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="modal-actions" style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+                  <button type="button" className="btn-secondary" style={{ flex: 1 }} onClick={() => setShowCatchMeUpModal(false)}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    style={{ flex: 1 }}
+                    disabled={catchMeUpSelected.size === 0}
+                    onClick={() => setCatchMeUpStep('summary')}
+                  >
+                    Continue
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>
+                  Summaries for {catchMeUpSelected.size} conversation{catchMeUpSelected.size === 1 ? '' : 's'} aren't ready yet — this is on the way.
+                </p>
+                <div className="modal-actions">
+                  <button type="button" className="btn-primary" onClick={() => setShowCatchMeUpModal(false)}>
+                    Done
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
       {messageMenu && (
         <div
           ref={messageMenuRef}
