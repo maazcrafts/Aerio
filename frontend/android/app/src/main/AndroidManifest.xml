@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density"
+            android:name=".MainActivity"
+            android:label="@string/title_activity_main"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:launchMode="singleTask"
+            android:exported="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"></meta-data>
+        </provider>
+
+        <!-- Push notifications (FCM via @capacitor/push-notifications). Sets
+             the small status-bar icon and accent color used for background/
+             closed-app notifications; without this Android falls back to a
+             plain white square. Backend also sends an explicit
+             android.notification.icon of the same name as a second source
+             of truth (see backend/push.js).
+
+             default_notification_channel_id is only a fallback for a push
+             that doesn't specify android.notification.channel_id — our own
+             backend (backend/push.js) always sets one explicitly, picking
+             between the four channels created in src/push.js
+             (aerio_messages_sv/s/v/n) based on the recipient's Notification
+             Sounds / Vibration settings. This points at the sound+vibrate
+             channel so that fallback still behaves sensibly. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_stat_aerio" />
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_color"
+            android:resource="@color/notification_icon_color" />
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="aerio_messages_sv" />
+    </application>
+
+    <!-- Permissions -->
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Required on Android 13+ (API 33) to show notifications at all; the
+         @capacitor/push-notifications plugin requests this at runtime via
+         PushNotifications.requestPermissions() (see src/push.js's
+         requestNotificationPermission/ensurePushRegistered), and also
+         declares this permission itself — listed explicitly here too for
+         clarity. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Required for voice/video calling (WebRTC getUserMedia inside the
+         WebView). Without these, the OS denies mic/camera access before the
+         call can even start — Capacitor's bridge requests the runtime
+         permission dialog automatically at call time as long as these are
+         declared here. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- VIBRATE must be declared for the Vibration setting's "on" channels
+         (aerio_messages_sv / aerio_messages_v, created in src/push.js) to
+         actually vibrate the device — without it, Android silently drops
+         the vibration pattern even though the channel says to use one. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Neither is strictly required to install the app — voice calling
+         should still work on a device with no camera, and the app itself
+         doesn't require a mic to function outside of calls. -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+</manifest>

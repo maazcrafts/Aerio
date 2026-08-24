@@ -1,0 +1,286 @@
+/* Shared UI-state styles — loading, error, offline, slow-network,
+   no-results and session-expired. Built on the app's existing CSS
+   variables so it always matches the current theme (including any
+   light-mode / accent-color overrides from appearance.js). */
+
+.ui-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+  padding: 40px 24px;
+  width: 100%;
+  height: 100%;
+  animation: fadeIn 0.2s ease;
+}
+
+.ui-state-compact {
+  padding: 20px 16px;
+}
+
+.ui-state-icon {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 6px;
+}
+
+.ui-state-compact .ui-state-icon {
+  width: 48px;
+  height: 48px;
+}
+
+.ui-state-icon-danger { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.ui-state-icon-muted { background: var(--primary-light); color: var(--text-muted); }
+.ui-state-icon-info { background: var(--primary-light); color: var(--primary); }
+.ui-state-icon-warning { background: rgba(249, 115, 22, 0.15); color: #f97316; }
+
+.ui-state-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-main);
+  margin: 0;
+}
+
+.ui-state-compact .ui-state-title {
+  font-size: 14px;
+}
+
+.ui-state-message {
+  font-size: 13px;
+  color: var(--text-muted);
+  max-width: 320px;
+  line-height: 1.5;
+  margin: 0 0 6px;
+}
+
+.ui-state-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 9px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.1s ease;
+}
+
+.ui-state-btn:active {
+  transform: scale(0.97);
+}
+
+.ui-state-btn-primary {
+  background: var(--primary);
+  color: #fff;
+}
+.ui-state-btn-primary:hover { filter: brightness(1.08); }
+
+.ui-state-btn-danger {
+  background: #ef4444;
+  color: #fff;
+}
+.ui-state-btn-danger:hover { filter: brightness(1.08); }
+
+.ui-state-btn-warning {
+  background: #f97316;
+  color: #fff;
+}
+.ui-state-btn-warning:hover { filter: brightness(1.08); }
+
+/* ── Progress bar (slow network) ─────────────────────────────────── */
+
+.ui-progress-track {
+  width: 100%;
+  max-width: 220px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--border-color);
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.ui-progress-fill {
+  height: 100%;
+  width: 40%;
+  border-radius: var(--radius-full);
+  background: var(--primary);
+  animation: uiProgressSlide 1.4s ease-in-out infinite;
+}
+
+@keyframes uiProgressSlide {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(60%); }
+  100% { transform: translateX(220%); }
+}
+
+.ui-snail-bounce {
+  animation: uiBounce 1.6s ease-in-out infinite;
+}
+
+@keyframes uiBounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+/* ── Skeleton / shimmer ──────────────────────────────────────────── */
+
+.ui-skeleton {
+  background: var(--border-color);
+  border-radius: var(--radius-sm);
+  position: relative;
+  overflow: hidden;
+}
+
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  animation: uiShimmer 1.5s infinite;
+}
+
+@keyframes uiShimmer {
+  100% { transform: translateX(100%); }
+}
+
+.ui-skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+}
+
+.ui-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 4px;
+}
+
+.ui-skeleton-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.ui-skeleton-row-lines {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ui-skeleton-line {
+  height: 10px;
+  border-radius: 5px;
+}
+
+.ui-skeleton-messages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 24px 20px;
+  width: 100%;
+  max-width: 420px;
+  margin: 0 auto;
+}
+
+.ui-skeleton-media {
+  width: 100%;
+  height: 140px;
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ui-skeleton-media-icon {
+  color: var(--text-muted);
+  opacity: 0.4;
+}
+
+.ui-skeleton-bubble-lines {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ui-skeleton-spinner-wrap {
+  margin-top: 10px;
+}
+
+.ui-spinner {
+  display: inline-block;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 3px solid var(--border-color);
+  border-top-color: var(--primary);
+  animation: uiSpin 0.8s linear infinite;
+}
+
+@keyframes uiSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Offline banner ──────────────────────────────────────────────── */
+
+.ui-offline-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: #ef4444;
+  padding: 7px 12px;
+  animation: fadeIn 0.2s ease;
+}
+
+/* ── Session expired overlay ─────────────────────────────────────── */
+
+.ui-session-expired-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 4000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-color);
+  padding: 20px;
+}
+
+.ui-session-expired-overlay .ui-state {
+  background: var(--panel-bg, #1e293b);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  max-width: 380px;
+  padding: 40px 28px;
+  box-shadow: var(--shadow-lg);
+}
+
+@media (max-width: 480px) {
+  .ui-state {
+    padding: 28px 16px;
+  }
+  .ui-session-expired-overlay .ui-state {
+    padding: 32px 20px;
+  }
+}
