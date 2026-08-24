@@ -560,6 +560,68 @@ body {
   position: relative;
 }
 
+/* Aerio home / default chat state */
+.aerio-home {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+  text-align: center;
+}
+
+.aerio-home-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 6px;
+}
+
+.aerio-home-subtitle {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 24px;
+}
+
+.catch-me-up-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 280px;
+  padding: 12px 16px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-main);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.catch-me-up-card:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: color-mix(in srgb, var(--primary) 30%, var(--border-color));
+}
+
+.catch-me-up-card svg {
+  color: var(--primary);
+  flex-shrink: 0;
+}
+
+.catch-me-up-card strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.catch-me-up-card small {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
 .chat-header {
   padding: 14px 20px;
   background: var(--panel-bg);
