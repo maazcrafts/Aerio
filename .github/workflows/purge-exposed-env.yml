@@ -26,6 +26,7 @@ jobs:
         run: |
           if git log --all -- frontend/.env | grep -q .; then
             git filter-repo --path frontend/.env --invert-paths --force
+            git remote add origin https://github.com/maazcrafts/Aerio.git
             git push origin main --force
           else
             echo "frontend/.env is already absent from all reachable history."
