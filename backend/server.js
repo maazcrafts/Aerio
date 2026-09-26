@@ -14,7 +14,10 @@ const db = require('./database');
 const jwt = require('jsonwebtoken');
 const push = require('./push');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-key-1234';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET is required. Set it in the backend environment before starting Aerio.');
+}
 const ADMIN_USERNAME = 'maaz_khan';
 
 // Tracks live socket connections per user (userId -> number of open sockets),
