@@ -1,0 +1,32 @@
+name: Purge exposed env history
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  purge:
+    if: contains(github.event.head_commit.message, '[purge-history]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install git-filter-repo
+        run: python3 -m pip install --user git-filter-repo
+
+      - name: Remove exposed env file from all history
+        run: |
+          if git log --all -- frontend/.env | grep -q .; then
+            git filter-repo --path frontend/.env --invert-paths --force
+            git push origin main --force
+          else
+            echo "frontend/.env is already absent from all reachable history."
+          fi
